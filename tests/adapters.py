@@ -9,6 +9,13 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from cs336_basics.pretokenization import parallel_count_pretokens, merge_from_pretoken_counts
+from cs336_basics.tokenizer import Tokenizer
+from cs336_basics.embedding import Linear, Embedding
+from cs336_basics.transformer import RMS, SwiGLU, RotaryPositionalEmbedding, Softmax, Attention, Multihead_Attention, transformer_block, Transformer
+from cs336_basics.loss import CE
+from cs336_basics import optimizer
+
 
 def run_linear(
     d_in: int,
@@ -29,7 +36,12 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    linear = Linear(d_in, d_out, weights.device, weights.dtype)
+    linear.load_state_dict({
+        "weight": weights,
+    })
+
+    return linear(in_features)
 
 
 def run_embedding(
@@ -51,7 +63,11 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    embedding = Embedding(vocab_size, d_model, weights.device, weights.dtype)
+    embedding.load_state_dict({
+        "weight": weights,
+    })
+    return embedding(token_ids)
 
 
 def run_swiglu(
@@ -83,7 +99,14 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    # d_ff = round((d_model*8/3.0) / 64) * 64
+    swiglu = SwiGLU(d_model, d_ff, w1_weight.device, w1_weight.dtype)
+    swiglu.load_state_dict({
+        "w1.weight": w1_weight,
+        "w2.weight": w2_weight,
+        "w3.weight": w3_weight,
+    })
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -104,7 +127,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    attn = Attention(mask)
+    return attn(Q, K, V)
 
 
 def run_multihead_self_attention(
@@ -138,7 +162,12 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    attn = Multihead_Attention(num_heads, d_model, in_features.device, in_features.dtype)
+    attn.load_state_dict({
+        "proj.weight": torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0),
+        "o_proj.weight": o_proj_weight,
+    })
+    return attn(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -178,7 +207,14 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len, in_features.device)
+
+    attn = Multihead_Attention(num_heads, d_model, in_features.device, in_features.dtype, rope)
+    attn.load_state_dict({
+        "proj.weight": torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0),
+        "o_proj.weight": o_proj_weight,
+    })
+    return attn(in_features, token_positions)
 
 
 def run_rope(
@@ -200,7 +236,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = RotaryPositionalEmbedding(theta, d_k, max_seq_len, in_query_or_key.device)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -273,7 +310,20 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    block = transformer_block(d_model, num_heads, d_ff, max_seq_len, theta)
+    block.load_state_dict({
+        "norm1.g": weights["ln1.weight"],
+        "norm2.g": weights["ln2.weight"],
+        "ffn.w1.weight": weights["ffn.w1.weight"],
+        "ffn.w2.weight": weights["ffn.w2.weight"],
+        "ffn.w3.weight": weights["ffn.w3.weight"],
+        "attn.proj.weight": torch.cat([
+            weights["attn.q_proj.weight"], 
+            weights["attn.k_proj.weight"], 
+            weights["attn.v_proj.weight"]], dim=0),
+        "attn.o_proj.weight": weights["attn.output_proj.weight"],
+    })
+    return block(in_features)
 
 
 def run_transformer_lm(
@@ -355,7 +405,39 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer = Transformer(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta)
+    transformer.load_state_dict({
+        "token_embedding.weight": weights["token_embeddings.weight"],
+        "norm.g": weights["ln_final.weight"],
+        "out_embedding.weight": weights["lm_head.weight"],
+        },
+        strict=False,
+    )
+
+    for layer, block in enumerate(transformer.blocks):
+        prefix = f"layers.{layer}."
+
+        block.load_state_dict({
+            "norm1.g": weights[prefix + "ln1.weight"],
+            "norm2.g": weights[prefix + "ln2.weight"],
+
+            "ffn.w1.weight": weights[prefix + "ffn.w1.weight"],
+            "ffn.w2.weight": weights[prefix + "ffn.w2.weight"],
+            "ffn.w3.weight": weights[prefix + "ffn.w3.weight"],
+
+            "attn.proj.weight": torch.cat(
+                [
+                    weights[prefix + "attn.q_proj.weight"],
+                    weights[prefix + "attn.k_proj.weight"],
+                    weights[prefix + "attn.v_proj.weight"],
+                ],
+                dim=0,
+            ),
+            "attn.o_proj.weight":
+                weights[prefix + "attn.output_proj.weight"],
+        })
+
+    return transformer(in_indices)
 
 
 def run_rmsnorm(
@@ -378,7 +460,11 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rms = RMS(d_model, eps, weights.device, weights.dtype)
+    rms.load_state_dict({
+        "g": weights,
+    })
+    return rms(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -431,7 +517,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    sm = Softmax(dim)
+    return sm(in_features)
 
 
 def run_cross_entropy(
@@ -449,7 +536,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return CE()(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -468,7 +555,7 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return optimizer.AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -559,7 +646,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -589,4 +676,13 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    token2cnt = parallel_count_pretokens(
+        str(input_path),
+        special_tokens,
+    )
+
+    return merge_from_pretoken_counts(
+        token2cnt,
+        vocab_size,
+        special_tokens,
+    )
